@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>视频链接生成器</title>
+<style>
+  :root {
+    --ink: #16161a;
+    --paper: #fafaf7;
+    --line: #16161a;
+    --accent: #e8433a;
+    --muted: #6b6b6f;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Segoe UI", Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .wrap {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 32px 20px 60px;
+  }
+  .eyebrow {
+    font-size: 13px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 6px;
+    font-weight: 600;
+  }
+  h1 {
+    font-size: 26px;
+    line-height: 1.25;
+    margin: 0 0 28px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  label {
+    display: block;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  textarea, input {
+    width: 100%;
+    font-size: 16px;
+    font-family: inherit;
+    padding: 14px 16px;
+    border: 2px solid var(--ink);
+    border-radius: 10px;
+    background: white;
+    color: var(--ink);
+  }
+  textarea:focus, input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  textarea { resize: none; height: 56px; margin-bottom: 20px; }
+  .field { margin-bottom: 20px; }
+  .row { display: flex; gap: 10px; }
+  .row .field { flex: 1; }
+  button {
+    width: 100%;
+    padding: 16px;
+    font-size: 16px;
+    font-weight: 700;
+    border: none;
+    border-radius: 10px;
+    background: var(--ink);
+    color: var(--paper);
+    cursor: pointer;
+  }
+  button:active { transform: scale(0.98); }
+  button.secondary {
+    background: transparent;
+    border: 2px solid var(--ink);
+    color: var(--ink);
+    margin-top: 10px;
+  }
+  .result {
+    margin-top: 28px;
+    padding: 18px;
+    border: 2px dashed var(--line);
+    border-radius: 10px;
+    background: white;
+    font-size: 14px;
+    line-height: 1.6;
+    word-break: break-all;
+    white-space: pre-wrap;
+    display: none;
+  }
+  .result.show { display: block; }
+  .status {
+    margin-top: 14px;
+    font-size: 14px;
+    font-weight: 600;
+    text-align: center;
+    min-height: 20px;
+    color: var(--accent);
+  }
+  .divider {
+    height: 1px;
+    background: var(--line);
+    opacity: 0.15;
+    margin: 32px 0;
+  }
+  .hint {
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  details summary {
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+    font-weight: 600;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">/ 视频总结小工具</p>
+  <h1>粘贴视频链接<br>生成给 Claude 的完整消息</h1>
+
+  <div class="field">
+    <label for="ytUrl">1. 粘贴 YouTube 链接</label>
+    <textarea id="ytUrl" placeholder="https://youtu.be/xxxxxxx" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+  </div>
+
+  <button id="pasteBtn" class="secondary" type="button">📋 从剪贴板粘贴</button>
+
+  <div class="divider"></div>
+
+  <button id="buildBtn" type="button">✨ 生成并复制</button>
+  <div class="status" id="status"></div>
+
+  <div class="result" id="result"></div>
+
+  <div class="divider"></div>
+
+  <details>
+    <summary>工具设置（服务地址 / 密钥）</summary>
+    <div class="row" style="margin-top:16px;">
+      <div class="field">
+        <label for="baseUrl">服务地址</label>
+        <input id="baseUrl" type="text" value="https://yt-transcript-service-production-394b.up.railway.app/transcript">
+      </div>
+    </div>
+    <div class="field">
+      <label for="apiKey">密钥 key</label>
+      <input id="apiKey" type="text" value="Aa121121">
+    </div>
+    <p class="hint">这两项会保存在这台设备的浏览器里，下次打开不用重填。</p>
+  </details>
+
+  <div class="divider"></div>
+  <p class="hint">
+    用法：复制视频链接 → 打开这个页面（建议添加到主屏幕）→ 点"从剪贴板粘贴"或手动粘贴 → 点"生成并复制" → 切回 Claude 聊天窗口粘贴发送即可。
+  </p>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const STORAGE_KEYS = { base: 'yt_tool_base', key: 'yt_tool_key' };
+
+  // 恢复保存的设置
+  const savedBase = localStorageSafe('get', STORAGE_KEYS.base);
+  const savedKey = localStorageSafe('get', STORAGE_KEYS.key);
+  if (savedBase) $('baseUrl').value = savedBase;
+  if (savedKey) $('apiKey').value = savedKey;
+
+  function localStorageSafe(action, key, value) {
+    try {
+      if (action === 'get') return window.localStorage.getItem(key);
+      if (action === 'set') window.localStorage.setItem(key, value);
+    } catch (e) { /* 隐私模式等场景下静默失败 */ }
+  }
+
+  $('baseUrl').addEventListener('change', () => localStorageSafe('set', STORAGE_KEYS.base, $('baseUrl').value.trim()));
+  $('apiKey').addEventListener('change', () => localStorageSafe('set', STORAGE_KEYS.key, $('apiKey').value.trim()));
+
+  $('pasteBtn').addEventListener('click', async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      $('ytUrl').value = text.trim();
+      setStatus('已从剪贴板粘贴');
+    } catch (e) {
+      setStatus('无法读取剪贴板，手动粘贴到上方输入框吧');
+    }
+  });
+
+  $('buildBtn').addEventListener('click', async () => {
+    const raw = $('ytUrl').value.trim();
+    if (!raw) { setStatus('先粘贴一个视频链接吧'); return; }
+
+    const base = $('baseUrl').value.trim();
+    const key = $('apiKey').value.trim();
+    localStorageSafe('set', STORAGE_KEYS.base, base);
+    localStorageSafe('set', STORAGE_KEYS.key, key);
+
+    // 去掉链接里多余的 ?si=... 分享参数，只保留纯净的视频地址
+    let cleanUrl = raw;
+    try {
+      const u = new URL(raw);
+      cleanUrl = u.origin + u.pathname;
+    } catch (e) { /* 不是标准URL就原样使用 */ }
+
+    const fullLink = `${base}?url=${encodeURIComponent(cleanUrl)}&key=${encodeURIComponent(key)}`;
+    const message = `帮我看看这个视频讲了什么，用这个接口获取内容:\n${fullLink}`;
+
+    $('result').textContent = message;
+    $('result').classList.add('show');
+
+    try {
+      await navigator.clipboard.writeText(message);
+      setStatus('✅ 已复制！切回 Claude 粘贴发送吧');
+    } catch (e) {
+      setStatus('生成好了，长按下方文字手动复制');
+    }
+  });
+
+  function setStatus(msg) {
+    $('status').textContent = msg;
+    setTimeout(() => { if ($('status').textContent === msg) $('status').textContent = ''; }, 4000);
+  }
+</script>
+</body>
+</html>
