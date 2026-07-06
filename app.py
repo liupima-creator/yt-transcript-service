@@ -82,7 +82,7 @@ def get_transcript(
         outtmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
         langs = [s.strip() for s in lang.split(",") if s.strip()]
 
-        ydl_opts = {
+        base_opts = {
             "skip_download": True,       # 不下载视频本体
             "writesubtitles": True,      # 有人工字幕就要
             "writeautomaticsub": True,   # 没有就用自动生成的
@@ -93,11 +93,29 @@ def get_transcript(
             "no_warnings": True,
         }
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"yt-dlp 处理失败: {e}")
+        # 云服务器 IP 经常被 YouTube 判定为"疑似机器人"，要求登录验证。
+        # 依次尝试几种不同的客户端伪装，绕开网页版的机器人检测。
+        # 不需要账号、不需要 cookie。
+        player_clients_to_try = ["android", "tv", "web_creator", "ios"]
+
+        info = None
+        last_error = None
+        for client in player_clients_to_try:
+            ydl_opts = dict(base_opts)
+            ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                break  # 成功了就跳出循环
+            except Exception as e:
+                last_error = e
+                continue
+
+        if info is None:
+            raise HTTPException(
+                status_code=502,
+                detail=f"yt-dlp 处理失败（已尝试多种客户端伪装均失败）: {last_error}",
+            )
 
         vtt_files = glob.glob(os.path.join(tmp_dir, "*.vtt"))
         if not vtt_files:
