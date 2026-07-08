@@ -20,6 +20,7 @@ import os
 import re
 import glob
 import tempfile
+import requests
 from fastapi import FastAPI, HTTPException, Query
 import yt_dlp
 
@@ -28,6 +29,11 @@ app = FastAPI(title="YouTube Transcript Service")
 # 简单的密钥保护，防止别人白嫖你的服务器资源和流量。
 # 部署时通过环境变量 API_KEY 设置，不要写死在代码里。
 API_KEY = os.environ.get("API_KEY", "")
+
+# 没有字幕的视频，会用 Groq 的 Whisper 语音转文字 API 兜底。
+# 没配这个变量的话，没字幕的视频就还是只能返回"没有字幕"。
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 
 def _check_key(key: str):
@@ -51,23 +57,94 @@ def _vtt_to_text(vtt_path: str) -> str:
         if not m:
             continue
         timestamp = m.group(1)
-        # 去掉时间戳行和 WEBVTT 头，剩下的当作文本
         text_lines = [
             ln for ln in block.splitlines()
             if "-->" not in ln and ln.strip() and not ln.strip().startswith("WEBVTT")
         ]
         text = " ".join(text_lines).strip()
-        # 去掉 <c> 之类的样式标签
         text = re.sub(r"<[^>]+>", "", text)
         if not text or text == last_text:
-            continue  # yt-dlp 自动字幕经常有重复行，去重一下
+            continue
         last_text = text
-        # 时间戳只保留到分:秒，够用了
         hh, mm, ss = timestamp.split(":")
         short_ts = f"{mm}:{ss}"
         lines_out.append(f"[{short_ts}] {text}")
 
     return "\n".join(lines_out)
+
+
+def _transcribe_with_groq(audio_path: str) -> str:
+    """把音频文件发给 Groq 的 Whisper 接口，返回带时间戳的文字稿。"""
+    with open(audio_path, "rb") as f:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            data={
+                "model": GROQ_WHISPER_MODEL,
+                "response_format": "verbose_json",
+            },
+            files={"file": (os.path.basename(audio_path), f, "audio/mpeg")},
+            timeout=300,
+        )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Groq 转录接口报错 ({resp.status_code}): {resp.text[:300]}")
+
+    data = resp.json()
+    segments = data.get("segments")
+    if not segments:
+        return data.get("text", "").strip()
+
+    lines_out = []
+    for seg in segments:
+        start = seg.get("start", 0)
+        mm = int(start // 60)
+        ss = int(start % 60)
+        text = seg.get("text", "").strip()
+        if text:
+            lines_out.append(f"[{mm:02d}:{ss:02d}] {text}")
+    return "\n".join(lines_out)
+
+
+def _download_audio(url: str, tmp_dir: str, player_clients):
+    """下载视频音频（转成小体积的低码率 mp3），用于没有字幕时的语音转录兜底。"""
+    outtmpl = os.path.join(tmp_dir, "audio_%(id)s.%(ext)s")
+    base_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "64",
+        }],
+        "postprocessor_args": {
+            "ffmpeg": ["-ar", "16000", "-ac", "1"],
+        },
+    }
+
+    info = None
+    last_error = None
+    for client in player_clients:
+        ydl_opts = dict(base_opts)
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            break
+        except Exception as e:
+            last_error = e
+            continue
+
+    if info is None:
+        raise RuntimeError(f"音频下载失败（已尝试多种客户端伪装）: {last_error}")
+
+    mp3_files = glob.glob(os.path.join(tmp_dir, "*.mp3"))
+    if not mp3_files:
+        raise RuntimeError("音频下载完成但没找到 mp3 文件")
+
+    return info, mp3_files[0]
 
 
 @app.get("/transcript")
@@ -83,9 +160,9 @@ def get_transcript(
         langs = [s.strip() for s in lang.split(",") if s.strip()]
 
         base_opts = {
-            "skip_download": True,       # 不下载视频本体
-            "writesubtitles": True,      # 有人工字幕就要
-            "writeautomaticsub": True,   # 没有就用自动生成的
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
             "subtitleslangs": langs,
             "subtitlesformat": "vtt",
             "outtmpl": outtmpl,
@@ -93,9 +170,6 @@ def get_transcript(
             "no_warnings": True,
         }
 
-        # 云服务器 IP 经常被 YouTube 判定为"疑似机器人"，要求登录验证。
-        # 依次尝试几种不同的客户端伪装，绕开网页版的机器人检测。
-        # 不需要账号、不需要 cookie。
         player_clients_to_try = ["android", "tv", "web_creator", "ios"]
 
         info = None
@@ -106,7 +180,7 @@ def get_transcript(
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
-                break  # 成功了就跳出循环
+                break
             except Exception as e:
                 last_error = e
                 continue
@@ -118,16 +192,32 @@ def get_transcript(
             )
 
         vtt_files = glob.glob(os.path.join(tmp_dir, "*.vtt"))
-        if not vtt_files:
-            return {
-                "title": info.get("title"),
-                "duration_seconds": info.get("duration"),
-                "source": "none",
-                "transcript": "",
-                "note": "这个视频没有可用字幕（人工或自动都没有）。",
-            }
 
-        # 按优先语言顺序找一个可用的字幕文件
+        if not vtt_files:
+            if not GROQ_API_KEY:
+                return {
+                    "title": info.get("title"),
+                    "duration_seconds": info.get("duration"),
+                    "source": "none",
+                    "transcript": "",
+                    "note": "这个视频没有可用字幕（人工或自动都没有），且未配置 Groq 语音转录（GROQ_API_KEY）。",
+                }
+            try:
+                audio_info, mp3_path = _download_audio(url, tmp_dir, player_clients_to_try)
+                transcript = _transcribe_with_groq(mp3_path)
+                return {
+                    "title": info.get("title"),
+                    "duration_seconds": info.get("duration"),
+                    "source": "groq_whisper",
+                    "transcript": transcript,
+                    "note": "该视频没有字幕，此文字稿由 Groq Whisper 语音识别自动生成，可能有转录误差。",
+                }
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"没有字幕，尝试语音转录也失败了: {e}",
+                )
+
         chosen = None
         for l in langs:
             for f in vtt_files:
@@ -140,7 +230,6 @@ def get_transcript(
             chosen = vtt_files[0]
 
         transcript = _vtt_to_text(chosen)
-        is_auto = "auto" in os.path.basename(chosen) or True  # yt-dlp 命名不总是可靠，保守标记
 
         return {
             "title": info.get("title"),
